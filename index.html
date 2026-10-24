@@ -255,7 +255,7 @@ svg.i.f{fill:currentColor;stroke:none}
 </svg>
 
 <audio id="audio" preload="auto" playsinline></audio>
-<input id="file" type="file" accept="audio/*,video/*,.mp3,.m4a,.aac,.wav,.flac,.ogg,.opus,.mp4,.mov,.m4v,.caf,.aif,.aiff" hidden>
+<input id="file" type="file" accept="audio/*,video/*,video/mp2t,.mp3,.m4a,.aac,.wav,.flac,.ogg,.opus,.mp4,.mov,.m4v,.ts,.m2ts,.mts,.caf,.aif,.aiff" hidden>
 
 <div id="app">
   <header class="top">
@@ -282,6 +282,11 @@ svg.i.f{fill:currentColor;stroke:none}
           <button id="btnEmptyDemo" class="btn">试听示例</button>
         </div>
         <div class="ver" id="verEmpty"></div>
+      </div>
+      <div id="busy" class="empty" hidden>
+        <h2 id="busyTitle">正在提取声音</h2>
+        <p id="busyMsg"></p>
+        <div class="row"><button id="btnBusyOk" class="btn" hidden>知道了</button></div>
       </div>
       <div id="wfnote" class="wfnote" hidden></div>
     </div>
@@ -395,7 +400,7 @@ svg.i.f{fill:currentColor;stroke:none}
 (function () {
 'use strict';
 
-var VERSION = '1.0.1';
+var VERSION = '1.0.2';
 var APP_NAME = 'AB 循环播放器';
 
 /* =====================================================================
@@ -850,6 +855,253 @@ var MP4 = (function () {
 /*DEMUX-END*/
 
 /* =====================================================================
+   TS 视频：提取声音并封装成 M4A（AAC）或 MP3 流
+   ===================================================================== */
+/*TS-BEGIN*/
+var TS = (function () {
+  var SRATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+  function concat(list, total) {
+    var out = new Uint8Array(total), o = 0;
+    for (var i = 0; i < list.length; i++) { out.set(list[i], o); o += list[i].length; }
+    return out;
+  }
+  function sniff(h) {
+    function ok(sz, off) { for (var i = 0; i < 3; i++) if (h[off + i * sz] !== 0x47) return false; return true; }
+    if (h.length >= 564 && ok(188, 0)) return { pkt: 188, off: 0 };
+    if (h.length >= 580 && ok(192, 4)) return { pkt: 192, off: 0 };
+    for (var s = 1; s < 200 && s + 564 <= h.length; s++) if (ok(188, s)) return { pkt: 188, off: s };
+    return null;
+  }
+  function secPush(st, data, pusi) {
+    if (pusi) {
+      var ptr = data[0];
+      data = data.subarray(1 + ptr);
+      st.buf = []; st.len = 0; st.active = true;
+    }
+    if (!st.active) return null;
+    st.buf.push(data.slice()); st.len += data.length;
+    var all = concat(st.buf, st.len);
+    if (all.length >= 3) {
+      var tot = 3 + (((all[1] & 15) << 8) | all[2]);
+      if (all.length >= tot) { st.active = false; return all.subarray(0, tot); }
+    }
+    return null;
+  }
+  function parsePat(sec) {
+    if (sec[0] !== 0x00) return -1;
+    var i = 8, end = sec.length - 4;
+    while (i + 4 <= end) {
+      var pn = (sec[i] << 8) | sec[i + 1], pid = ((sec[i + 2] & 0x1f) << 8) | sec[i + 3];
+      if (pn !== 0) return pid;
+      i += 4;
+    }
+    return -1;
+  }
+  function parsePmt(sec) {
+    if (sec[0] !== 0x02) return null;
+    var pi = ((sec[10] & 15) << 8) | sec[11], i = 12 + pi, end = sec.length - 4, out = [];
+    while (i + 5 <= end) {
+      var il = ((sec[i + 3] & 15) << 8) | sec[i + 4];
+      out.push({ type: sec[i], pid: ((sec[i + 1] & 0x1f) << 8) | sec[i + 2] });
+      i += 5 + il;
+    }
+    return out;
+  }
+  function typeName(t) {
+    var m = { 0x81: 'AC-3', 0x87: 'E-AC-3', 0x11: 'AAC-LATM', 0x06: '私有数据（可能是 AC-3）', 0x80: 'LPCM', 0x82: 'DTS', 0x8A: 'DTS' };
+    return m[t] || ('类型 0x' + t.toString(16));
+  }
+
+  /* 读取整个 TS，取出声音轨的原始数据 */
+  function readAudio(file, onProgress, cancelled) {
+    var size = file.size;
+    return file.slice(0, Math.min(size, 4096)).arrayBuffer().then(function (ab) {
+      var info = sniff(new Uint8Array(ab));
+      if (!info) throw new Error('不是常见的 TS 视频文件');
+      var pkt = info.pkt, skip = pkt === 192 ? 4 : 0, CH = pkt * 16000, pos = info.off;
+      var pat = { active: false, buf: [], len: 0 }, pmt = { active: false, buf: [], len: 0 };
+      var pmtPid = -1, audio = null, unsupported = [], es = [], esLen = 0, started = false, pmtSeen = false, scanned = 0;
+      function step() {
+        if (cancelled()) throw new Error('已取消');
+        if (pos >= size) return Promise.resolve();
+        var end = Math.min(size, pos + CH);
+        return file.slice(pos, end).arrayBuffer().then(function (ab2) {
+          var b = new Uint8Array(ab2), n = Math.floor(b.length / pkt);
+          for (var k = 0; k < n; k++) {
+            var o = k * pkt + skip;
+            if (b[o] !== 0x47) continue;
+            var pid = ((b[o + 1] & 0x1f) << 8) | b[o + 2], pusi = (b[o + 1] & 0x40) !== 0, afc = (b[o + 3] >> 4) & 3;
+            if (!(afc & 1) || (b[o + 3] & 0xC0)) continue;
+            var ps = o + 4, pe = o + 188;
+            if (afc & 2) ps += 1 + b[o + 4];
+            if (ps >= pe) continue;
+            if (pid === 0 && pmtPid < 0) {
+              var s1 = secPush(pat, b.subarray(ps, pe), pusi);
+              if (s1) { var pp = parsePat(s1); if (pp >= 0) pmtPid = pp; }
+            } else if (pid === pmtPid && !pmtSeen) {
+              var s2 = secPush(pmt, b.subarray(ps, pe), pusi);
+              if (s2) {
+                var list = parsePmt(s2);
+                if (list) {
+                  pmtSeen = true;
+                  var priv = null;
+                  for (var q = 0; q < list.length; q++) {
+                    var t = list[q].type;
+                    if (!audio && (t === 0x0F || t === 0x03 || t === 0x04)) audio = { pid: list[q].pid, kind: t === 0x0F ? 'aac' : 'mp3' };
+                    else if (t === 0x06 && !priv) priv = list[q].pid;
+                    else if (t === 0x81 || t === 0x87 || t === 0x11 || t === 0x80 || t === 0x82 || t === 0x8A) unsupported.push(typeName(t));
+                  }
+                  if (!audio && priv !== null) audio = { pid: priv, kind: 'auto' };
+                }
+              }
+            } else if (audio && pid === audio.pid) {
+              if (pusi) {
+                if (b[ps] === 0 && b[ps + 1] === 0 && b[ps + 2] === 1 && ps + 9 <= pe) {
+                  ps += 9 + b[ps + 8]; started = true;
+                } else continue;
+              } else if (!started) continue;
+              if (ps < pe) { var piece = b.slice(ps, pe); es.push(piece); esLen += piece.length; }
+            }
+          }
+          pos += Math.max(1, n) * pkt;
+          scanned += b.length;
+          if (onProgress) onProgress(Math.min(1, pos / size));
+          if (!pmtSeen && scanned > 32 * 1048576) throw new Error('找不到声音信息（节目表缺失）');
+          return step();
+        });
+      }
+      return step().then(function () {
+        if (!audio) {
+          if (unsupported.length) throw new Error('这个 TS 的声音格式暂不支持：' + unsupported.join('、'));
+          throw new Error('这个 TS 文件里没有找到声音');
+        }
+        if (esLen < 2000) throw new Error('这个 TS 文件里的声音数据太少');
+        return { kind: audio.kind, data: concat(es, esLen) };
+      });
+    });
+  }
+
+  /* 把 ADTS 数据拆成原始 AAC 帧 */
+  function parseAdts(es) {
+    var i = 0, frames = [], cfg = null, n = es.length;
+    while (i + 7 <= n) {
+      if (es[i] !== 0xFF || (es[i + 1] & 0xF6) !== 0xF0) { i++; continue; }
+      var hdr = (es[i + 1] & 1) ? 7 : 9;
+      var fl = ((es[i + 3] & 3) << 11) | (es[i + 4] << 3) | (es[i + 5] >> 5);
+      if (fl <= hdr || i + fl > n) { i++; continue; }
+      if (i + fl + 2 <= n && !(es[i + fl] === 0xFF && (es[i + fl + 1] & 0xF6) === 0xF0)) { i++; continue; }
+      var c = { obj: ((es[i + 2] >> 6) & 3) + 1, fi: (es[i + 2] >> 2) & 15, ch: ((es[i + 2] & 1) << 2) | (es[i + 3] >> 6) };
+      if (!cfg) cfg = c;
+      if (c.obj === cfg.obj && c.fi === cfg.fi && c.ch === cfg.ch) frames.push([i + hdr, i + fl]);
+      i += fl;
+    }
+    if (!cfg || frames.length < 10) throw new Error('这个 TS 里的 AAC 声音数据不完整');
+    if (cfg.fi > 12 || cfg.ch < 1) throw new Error('这个 TS 里的 AAC 参数不支持');
+    return { frames: frames, cfg: cfg };
+  }
+
+  /* ---- 简易 MP4 写入 ---- */
+  function u32(n) { return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]; }
+  function u16(n) { return [(n >>> 8) & 255, n & 255]; }
+  function str(s) { var a = []; for (var i = 0; i < s.length; i++) a.push(s.charCodeAt(i) & 255); return a; }
+  function zeros(n) { var a = new Array(n); for (var i = 0; i < n; i++) a[i] = 0; return a; }
+  function box(type, parts) {
+    var body = [];
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p instanceof Uint8Array) { for (var j = 0; j < p.length; j++) body.push(p[j]); }
+      else for (var k = 0; k < p.length; k++) body.push(p[k]);
+    }
+    return u32(body.length + 8).concat(str(type), body);
+  }
+  function buildMoov(cfg, n, sizes, chunkOffsets, perChunk) {
+    var sr = SRATES[cfg.fi], dur = n * 1024;
+    var asc = [(cfg.obj << 3) | (cfg.fi >> 1), ((cfg.fi & 1) << 7) | (cfg.ch << 3)];
+    var dsi = [0x05, asc.length].concat(asc);
+    var dcd = [0x04, 13 + dsi.length, 0x40, 0x15, 0, 0, 0].concat(u32(0), u32(0), dsi);
+    var slc = [0x06, 0x01, 0x02];
+    var esd = [0x03, 3 + dcd.length + slc.length, 0, 1, 0].concat(dcd, slc);
+    var esds = box('esds', [u32(0), esd]);
+    var mp4a = box('mp4a', [zeros(6), u16(1), zeros(8), u16(cfg.ch), u16(16), u16(0), u16(0), u32(Math.min(sr, 65535) * 65536), esds]);
+    var stsd = box('stsd', [u32(0), u32(1), mp4a]);
+    var stts = box('stts', [u32(0), u32(1), u32(n), u32(1024)]);
+    var nChunks = chunkOffsets.length, rem = n - perChunk * (nChunks - 1);
+    var scEntries = [u32(1), u32(perChunk), u32(1)], scCount = 1;
+    if (rem !== perChunk) { scEntries.push(u32(nChunks), u32(rem), u32(1)); scCount = 2; }
+    var stsc = box('stsc', [u32(0), u32(scCount)].concat(scEntries));
+    var szs = [u32(0), u32(0), u32(n)];
+    for (var i = 0; i < n; i++) szs.push(u32(sizes[i]));
+    var stsz = box('stsz', szs);
+    var cos = [u32(0), u32(nChunks)];
+    for (var c = 0; c < nChunks; c++) cos.push(u32(chunkOffsets[c]));
+    var stco = box('stco', cos);
+    var stbl = box('stbl', [stsd, stts, stsc, stsz, stco]);
+    var dref = box('dref', [u32(0), u32(1), box('url ', [u32(1)])]);
+    var dinf = box('dinf', [dref]);
+    var smhd = box('smhd', [u32(0), u16(0), u16(0)]);
+    var minf = box('minf', [smhd, dinf, stbl]);
+    var hdlr = box('hdlr', [u32(0), u32(0), str('soun'), zeros(12), str('SoundHandler'), [0]]);
+    var mdhd = box('mdhd', [u32(0), u32(0), u32(0), u32(sr), u32(dur), u16(0x55C4), u16(0)]);
+    var mdia = box('mdia', [mdhd, hdlr, minf]);
+    var mdurMovie = Math.round(dur / sr * 1000);
+    var tkhd = box('tkhd', [u32(7), u32(0), u32(0), u32(1), u32(0), u32(mdurMovie), zeros(8), u16(0), u16(0), u16(0x0100), u16(0),
+      u32(0x10000), u32(0), u32(0), u32(0), u32(0x10000), u32(0), u32(0), u32(0), u32(0x40000000), u32(0), u32(0)]);
+    var trak = box('trak', [tkhd, mdia]);
+    var mvhd = box('mvhd', [u32(0), u32(0), u32(0), u32(1000), u32(mdurMovie), u32(0x10000), u16(0x0100), zeros(10),
+      u32(0x10000), u32(0), u32(0), u32(0), u32(0x10000), u32(0), u32(0), u32(0), u32(0x40000000), zeros(24), u32(2)]);
+    return new Uint8Array(box('moov', [mvhd, trak]));
+  }
+  function buildM4a(es, parsed) {
+    var frames = parsed.frames, cfg = parsed.cfg, n = frames.length, perChunk = 50;
+    var sizes = new Array(n), total = 0, i;
+    for (i = 0; i < n; i++) { sizes[i] = frames[i][1] - frames[i][0]; total += sizes[i]; }
+    if (total > 3.9e9) throw new Error('声音数据过大');
+    var nChunks = Math.ceil(n / perChunk);
+    var ftyp = new Uint8Array(box('ftyp', [str('M4A '), u32(0), str('M4A '), str('mp42'), str('isom')]));
+    var offs = new Array(nChunks);
+    var moov = buildMoov(cfg, n, sizes, zeros(nChunks), perChunk);
+    var base = ftyp.length + moov.length + 8, acc = 0;
+    for (var c = 0; c < nChunks; c++) {
+      offs[c] = base + acc;
+      for (var j = c * perChunk; j < Math.min(n, (c + 1) * perChunk); j++) acc += sizes[j];
+    }
+    moov = buildMoov(cfg, n, sizes, offs, perChunk);
+    var out = new Uint8Array(ftyp.length + moov.length + 8 + total), o = 0;
+    out.set(ftyp, o); o += ftyp.length;
+    out.set(moov, o); o += moov.length;
+    out.set(u32(total + 8), o); o += 4;
+    out.set(str('mdat'), o); o += 4;
+    for (i = 0; i < n; i++) { out.set(es.subarray(frames[i][0], frames[i][1]), o); o += sizes[i]; }
+    return { data: out, frames: n, sr: SRATES[cfg.fi], ch: cfg.ch, duration: n * 1024 / SRATES[cfg.fi] };
+  }
+
+  /* 入口：返回 { data, ext, type, note } */
+  function extractAudio(file, onProgress, cancelled) {
+    return readAudio(file, onProgress, cancelled).then(function (r) {
+      if (r.kind === 'auto') {
+        var d0 = r.data, j = 0, lim = Math.min(d0.length - 2, 4000);
+        while (j < lim && !(d0[j] === 0xFF && (d0[j + 1] & 0xF6) === 0xF0) && !(d0[j] === 0xFF && (d0[j + 1] & 0xE0) === 0xE0) && !(d0[j] === 0x0B && d0[j + 1] === 0x77)) j++;
+        if (d0[j] === 0xFF && (d0[j + 1] & 0xF6) === 0xF0) r.kind = 'aac';
+        else if (d0[j] === 0xFF && (d0[j + 1] & 0xE0) === 0xE0) r.kind = 'mp3';
+        else throw new Error('这个 TS 的声音格式暂不支持：' + (d0[j] === 0x0B && d0[j + 1] === 0x77 ? 'AC-3' : '无法识别'));
+        r.data = d0.subarray(j);
+      }
+      if (r.kind === 'aac') {
+        var parsed = parseAdts(r.data), m = buildM4a(r.data, parsed);
+        return { data: m.data, ext: 'm4a', type: 'audio/mp4', info: 'AAC ' + m.sr + 'Hz ' + m.ch + '声道 ' + m.frames + '帧 约' + m.duration.toFixed(1) + '秒' };
+      }
+      var es = r.data, i = 0;
+      while (i + 2 < es.length && !(es[i] === 0xFF && (es[i + 1] & 0xE0) === 0xE0)) i++;
+      if (es.length - i < 2000) throw new Error('这个 TS 里的 MP3 声音数据不完整');
+      return { data: es.subarray(i), ext: 'mp3', type: 'audio/mpeg', info: 'MP3 流 ' + (es.length - i) + ' 字节' };
+    });
+  }
+  return { sniff: sniff, extractAudio: extractAudio, parseAdts: parseAdts };
+})();
+/*TS-END*/
+
+/* =====================================================================
    应用
    ===================================================================== */
 var $ = function (id) { return document.getElementById(id); };
@@ -868,7 +1120,7 @@ function hasIDB() { try { return !!window.indexedDB; } catch (e) { return false;
 function saveCfg() { try { localStorage.setItem(K_SET, JSON.stringify(cfg)); } catch (e) { } }
 
 var S = {
-  file: null, fp: '', name: '', size: 0, type: '', isDemo: false,
+  file: null, fp: '', name: '', size: 0, type: '', isDemo: false, note: '',
   dur: 0, A: null, B: null, abOn: false, markers: [], rate: 1,
   token: 0, pps: Math.min(300, Math.max(15, +cfg.pps || 60)),
   peaks: null, wf: { state: 'idle', method: '', pct: 0, ms: 0, msg: '' },
@@ -1559,6 +1811,7 @@ function updateUI() {
     var vid = /^video\//.test(S.type) || /\.(mp4|mov|m4v)$/i.test(S.name);
     sub = [extOf(S.name), fmtSize(S.size), S.dur ? fmtT(S.dur, 0) : '', vid ? '视频，仅播放声音' : ''].filter(Boolean).join(' · ');
     if (S.isDemo) sub = '示例 · 合成音 · ' + fmtT(S.dur, 0);
+    if (S.note) sub += ' · ' + S.note;
   }
   $('sub').textContent = sub;
   updateNudge();
@@ -1699,13 +1952,46 @@ function resetForNewFile() {
   S.stats = { jumps: 0, hiddenJumps: 0, maxOver: 0, lastOver: 0, sysPauses: 0, waits: 0 };
   lastT = 0;
 }
+function isTsFile(file) {
+  return /\.(ts|m2ts|mts)$/i.test(file.name || '') || file.type === 'video/mp2t';
+}
+function showBusy(title, msg, ok) {
+  $('busyTitle').textContent = title; $('busyMsg').textContent = msg; $('btnBusyOk').hidden = !ok; $('busy').hidden = false;
+}
+function openTs(file, opt) {
+  try {
+    Diag.act('打开 TS 视频：' + Diag.maskName(file.name) + '，' + fmtSize(file.size) + '，类型 ' + (file.type || '未知'));
+    resetForNewFile();
+    var token = S.token, t0 = performance.now(), lastShown = -1;
+    S.file = null; S.name = ''; S.size = 0; S.type = ''; S.note = ''; S.isDemo = false; S.wf = { state: 'idle', method: '', pct: 0, ms: 0, msg: '' };
+    updateUI(); updateWfNote(); requestDraw();
+    showBusy('正在提取声音', '从 TS 视频里取出声音，原文件不会被改动。0%', false);
+    var fp = opt.fp || (file.name + '|' + file.size + '|' + (file.lastModified || 0));
+    TS.extractAudio(file, function (p) {
+      var pct = Math.round(p * 100);
+      if (pct !== lastShown && token === S.token) { lastShown = pct; $('busyMsg').textContent = '从 TS 视频里取出声音，原文件不会被改动。' + pct + '%'; }
+    }, function () { return token !== S.token; }).then(function (r) {
+      if (token !== S.token) return;
+      Diag.info('TS', '提取完成：' + r.info + '，用时 ' + Math.round(performance.now() - t0) + 'ms，输出 ' + fmtSize(r.data.length));
+      var base = baseName(file.name || 'video');
+      var out = new File([r.data], base + '.' + r.ext, { type: r.type, lastModified: file.lastModified || Date.now() });
+      $('busy').hidden = true;
+      openFile(out, { fp: fp, note: '来自TS视频', fromTs: true });
+    }).catch(function (e) {
+      if (token !== S.token) return;
+      Diag.error('TS', '提取失败：' + (e && e.message));
+      showBusy('这个 TS 文件打不开', (e && e.message ? e.message : '未知原因') + '。可以换成 MP4 或 MP3 再试。', true);
+    });
+  } catch (e) { Diag.err('打开TS', e); toast('打开文件出错，请再试一次'); }
+}
 function openFile(file, opt) {
   opt = opt || {};
   if (!file) return;
+  if (!opt.fromTs && isTsFile(file)) { openTs(file, opt); return; }
   try {
     Diag.act('打开文件：' + Diag.maskName(file.name) + '，' + fmtSize(file.size) + '，类型 ' + (file.type || '未知'));
-    resetForNewFile();
-    S.file = file; S.name = file.name || '未命名'; S.size = file.size; S.type = file.type || ''; S.isDemo = !!opt.demo;
+    resetForNewFile(); $('busy').hidden = true;
+    S.file = file; S.name = file.name || '未命名'; S.size = file.size; S.type = file.type || ''; S.isDemo = !!opt.demo; S.note = opt.note || '';
     S.fp = opt.fp || (S.name + '|' + S.size + '|' + (file.lastModified || 0));
     var meta = metaAll()[S.fp];
     if (meta) {
@@ -1913,6 +2199,7 @@ Diag.setState(function () {
   var o = {};
   o['软件版本'] = 'v' + VERSION;
   o['文件'] = S.file ? Diag.maskName(S.name) + '，' + fmtSize(S.size) + '，类型 ' + (S.type || '未知') + (S.isDemo ? '（示例）' : '') : '（未打开）';
+  if (S.note) o['来源说明'] = S.note;
   o['时长'] = S.dur ? S.dur.toFixed(2) + ' 秒' : '未知';
   o['播放中'] = S.file ? !audio.paused : false;
   o['当前位置'] = S.file ? (audio.currentTime || 0).toFixed(2) + ' 秒' : '-';
@@ -1950,6 +2237,7 @@ function wireUI() {
     try { fileInput.value = ''; } catch (e) { }
   }, '选择文件'));
 
+  on('btnBusyOk', 'click', function () { $('busy').hidden = true; });
   on('btnPlay', 'click', togglePlay);
   on('btnBack', 'click', function () { skip(-cfg.skip); });
   on('btnFwd', 'click', function () { skip(cfg.skip); });

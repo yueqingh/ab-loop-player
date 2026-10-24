@@ -1,0 +1,15 @@
+AB 循环播放器 v1.0.2 —— 上传到 GitHub 的文件
+
+先把这个压缩包解压，得到 5 个文件：
+  index.html、manifest.webmanifest、icon-192.png、icon-512.png、apple-touch-icon.png
+上传时文件名不要改。
+
+1. 登录 github.com，点右上角 + → New repository。名字填 ab-loop-player，选 Public，勾上 Add a README file，点 Create repository。
+   （已经建好仓库的话跳过这一步）
+2. 进入仓库，点 Add file → Upload files，把 5 个文件一起拖进去，点 Commit changes。
+   （更新版本时，用同样的方法上传，同名文件会被替换）
+3. 点 Settings → 左边 Pages。Source 选 Deploy from a branch，分支选 main，文件夹选 / (root)，点 Save。
+4. 等 1 到 2 分钟再刷新，页面上方会出现网址，一般是 https://你的用户名.github.io/ab-loop-player/
+5. 用 iPhone 的 Safari 打开网址，点 分享 → 添加到主屏幕。
+
+更新后如果手机上还是旧版：关掉主屏幕里的 App，再重新打开；还不行就在设置里看版本号（应为 v1.0.2）。
